@@ -112,71 +112,6 @@ const Icon = {
   X:(p) => (<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" {...p}><path d="M6 6l12 12M18 6l-12 12"/></svg>),
 };
 
-// ---------- Seed data ----------
-function seedFor() {
-  // Seed against this week starting Saturday.
-  const sat = startOfWeekSat(TODAY);
-  const groups = []; const todos = [];
-  const make = (offset, gTitle, items) => {
-    const dateKey = toKey(addDays(sat, offset));
-    const gid = WeeklyDB.uid('g');
-    groups.push({
-      id: gid, dateKey, title: gTitle,
-      order: groups.filter(g => g.dateKey === dateKey).length, collapsed: false,
-    });
-    items.forEach((t, i) => todos.push({
-      id: WeeklyDB.uid('t'), groupId: gid, title: t.title,
-      done: !!t.done, order: i, createdAt: Date.now() + i,
-    }));
-  };
-  // Saturday (offset 0) … Friday (offset 6)
-  make(0, 'Morning', [
-    { title: 'Long run — 8 km #fitness', done: true },
-    { title: 'Stretch + foam roll #fitness', done: true },
-    { title: 'Cold shower' },
-  ]);
-  make(0, 'House', [
-    { title: 'Grocery run #errands' },
-    { title: 'Water the plants #home' },
-    { title: 'Pay phone bill #bills', done: true },
-  ]);
-  make(1, 'Family', [
-    { title: 'Brunch with parents #family' },
-    { title: 'Call grandma #family' },
-  ]);
-  make(2, 'Work — focus block', [
-    { title: 'Draft Q3 OKR doc #work' },
-    { title: 'Review PR #284 #work', done: true },
-    { title: 'Sync with design on tablet PWA #work' },
-    { title: 'Inbox to zero #work' },
-  ]);
-  make(2, 'Errands', [
-    { title: 'Drop package at post office #errands' },
-    { title: 'Pharmacy refill #errands' },
-  ]);
-  make(3, 'Work', [
-    { title: '1:1 with Maya, 10:00 #work' },
-    { title: 'Roadmap review prep #work' },
-  ]);
-  make(3, 'Health', [
-    { title: 'Yoga, 18:30 #fitness' },
-  ]);
-  make(4, 'Deep work', [
-    { title: 'Write proposal: weekly review ritual #work' },
-    { title: 'Outline talk for All-Hands #work' },
-  ]);
-  make(5, 'Personal', [
-    { title: 'Book dentist #health' },
-    { title: 'Reply to Sam re: trip #personal' },
-  ]);
-  make(6, 'Wrap up', [
-    { title: 'Weekly review #work' },
-    { title: 'Tidy desk + inbox #work' },
-    { title: 'Plan next week' },
-  ]);
-  return { groups, todos };
-}
-
 // ---------- App ----------
 function App() {
   const { pref, setPref, isDark } = useTheme();
@@ -195,9 +130,14 @@ function App() {
   // Load
   useEffect(() => {
     (async () => {
-      const seed = seedFor();
-      const wsKey = toKey(startOfWeekSat(TODAY));
-      await WeeklyDB.bulkSeed(seed.groups, seed.todos, wsKey);
+      // One-time cleanup: previous builds shipped seeded sample tasks. Wipe them
+      // for any existing install, exactly once. New installs no-op.
+      try {
+        if (!localStorage.getItem('weekly-todo-seed-wiped-v1')) {
+          await WeeklyDB.clearAll();
+          localStorage.setItem('weekly-todo-seed-wiped-v1', '1');
+        }
+      } catch (_) {}
       const [g, t, s] = await Promise.all([
         WeeklyDB.getAllGroups(), WeeklyDB.getAllTodos(), WeeklyDB.getAllStrokes(),
       ]);
@@ -266,6 +206,20 @@ function App() {
     setStrokes((p) => p.filter((s) => s.dateKey !== dateKey));
     await WeeklyDB.clearStrokesFor(dateKey);
   };
+  const bulkClearDays = async (dateKeys, opts) => {
+    const o = opts || { tasks: true, sketches: false };
+    const keySet = new Set(dateKeys);
+    if (keySet.size === 0) return;
+    if (o.tasks) {
+      const removedGroupIds = new Set(groups.filter((g) => keySet.has(g.dateKey)).map((g) => g.id));
+      setGroups((p) => p.filter((g) => !keySet.has(g.dateKey)));
+      setTodos((p) => p.filter((t) => !removedGroupIds.has(t.groupId)));
+    }
+    if (o.sketches) {
+      setStrokes((p) => p.filter((s) => !keySet.has(s.dateKey)));
+    }
+    await WeeklyDB.clearDays(Array.from(keySet), o);
+  };
 
   // Derived: groups for active day, with todos
   const dayGroups = useMemo(() => {
@@ -278,14 +232,17 @@ function App() {
   // Per-day totals (across loaded data)
   const totalsByKey = useMemo(() => {
     const map = {};
+    const ensure = (k) => (map[k] ||= { done: 0, total: 0, lists: 0, strokes: 0 });
+    for (const g of groups) ensure(g.dateKey).lists += 1;
     for (const t of todos) {
       const g = groups.find((x) => x.id === t.groupId);
       if (!g) continue;
-      const m = (map[g.dateKey] ||= { done: 0, total: 0 });
+      const m = ensure(g.dateKey);
       m.total += 1; if (t.done) m.done += 1;
     }
+    for (const s of strokes) ensure(s.dateKey).strokes += 1;
     return map;
-  }, [groups, todos]);
+  }, [groups, todos, strokes]);
 
   // Tag index
   const allTags = useMemo(() => {
@@ -356,6 +313,241 @@ function App() {
     inp.click();
   };
 
+  // ---------- PDF export ----------
+  // Renders a print-friendly HTML doc into a hidden iframe, then triggers print().
+  // On Android WebView, print() routes to PrintManager → "Save as PDF" sheet.
+  const exportPdf = (scope) => {
+    // scope: 'day' | 'week'
+    const days = scope === 'week'
+      ? Array.from({ length: 7 }, (_, i) => addDays(weekStart, i))
+      : [fromKey(dateKey)];
+
+    // Snapshot strokes for each printed day to inline <img> data URIs.
+    const dayBlocks = days.map((d) => {
+      const k = toKey(d);
+      const dGroups = groups
+        .filter((g) => g.dateKey === k)
+        .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+      const blocks = dGroups.map((g) => {
+        const items = todos
+          .filter((t) => t.groupId === g.id)
+          .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+        const done = items.filter((i) => i.done).length;
+        return { group: g, items, done, total: items.length };
+      });
+      const dStrokes = strokes.filter((s) => s.dateKey === k);
+      const sketchPng = dStrokes.length ? renderStrokesToPng(dStrokes) : null;
+      const total = blocks.reduce((s, b) => s + b.total, 0);
+      const doneSum = blocks.reduce((s, b) => s + b.done, 0);
+      return { date: d, key: k, blocks, sketchPng, total, doneSum };
+    });
+
+    const title = scope === 'week'
+      ? `Week of ${MONTHS[days[0].getMonth()].slice(0,3)} ${days[0].getDate()} – ${MONTHS[days[6].getMonth()].slice(0,3)} ${days[6].getDate()}, ${days[6].getFullYear()}`
+      : `${DOW_LONG[days[0].getDay()]}, ${MONTHS[days[0].getMonth()]} ${days[0].getDate()}, ${days[0].getFullYear()}`;
+
+    const html = buildPrintHtml({ title, scope, days: dayBlocks, isDark });
+    openPrintFrame(html, title);
+  };
+
+  // Render strokes to a PNG data URI sized for print (1600×900-ish keeps file small).
+  function renderStrokesToPng(dStrokes) {
+    const W = 1400, H = 800;
+    const c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, W, H);
+    for (const s of dStrokes) {
+      const pts = s.points;
+      if (!pts || pts.length === 0) continue;
+      ctx.save();
+      ctx.strokeStyle = s.color;
+      ctx.fillStyle = s.color;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      if (s.tool === 'highlighter') { ctx.globalAlpha = 0.32; ctx.globalCompositeOperation = 'multiply'; }
+      else { ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; }
+      if (pts.length === 1) {
+        const p = pts[0];
+        ctx.beginPath();
+        ctx.arc(p.x * W, p.y * H, (s.width * (p.p || 0.5)) / 2 + 0.5, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        for (let i = 1; i < pts.length; i++) {
+          const a = pts[i - 1], b = pts[i];
+          const w = s.width * ((a.p + b.p) / 2 || 0.6);
+          ctx.lineWidth = Math.max(0.5, w);
+          ctx.beginPath();
+          ctx.moveTo(a.x * W, a.y * H);
+          ctx.lineTo(b.x * W, b.y * H);
+          ctx.stroke();
+        }
+      }
+      ctx.restore();
+    }
+    return c.toDataURL('image/png');
+  }
+
+  function escapeHtml(s) {
+    return String(s ?? '').replace(/[&<>"']/g, (m) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    })[m]);
+  }
+
+  function buildPrintHtml({ title, scope, days, isDark }) {
+    const css = `
+      @page { size: A4; margin: 14mm; }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; padding: 0; background: #ffffff; color: #15161b; }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        font-size: 11pt; line-height: 1.45;
+      }
+      .doc-head {
+        display: flex; align-items: baseline; justify-content: space-between;
+        border-bottom: 2px solid #15161b; padding-bottom: 10pt; margin-bottom: 18pt;
+      }
+      .doc-title { font-size: 22pt; font-weight: 700; letter-spacing: -0.01em; margin: 0; }
+      .doc-sub { font-size: 9pt; color: #5b5d68; }
+      .day { page-break-inside: avoid; margin-bottom: 18pt; }
+      .day + .day { border-top: 1px solid #d6d6d8; padding-top: 12pt; }
+      .day-week { page-break-after: always; }
+      .day-week:last-child { page-break-after: auto; }
+      .day-head {
+        display: flex; align-items: baseline; gap: 12pt; margin-bottom: 10pt;
+      }
+      .day-h { font-size: 16pt; font-weight: 700; margin: 0; letter-spacing: -0.005em; }
+      .day-date { color: #5b5d68; font-size: 10pt; }
+      .day-totals { margin-left: auto; font-size: 10pt; color: #15161b;
+        background: #f1f1f3; padding: 2pt 8pt; border-radius: 999pt; }
+      .group { margin: 10pt 0 14pt; page-break-inside: avoid; }
+      .group-h {
+        display: flex; align-items: baseline; gap: 10pt;
+        font-size: 12pt; font-weight: 600; margin: 0 0 4pt;
+      }
+      .group-count { color: #5b5d68; font-size: 9pt; font-variant-numeric: tabular-nums; }
+      .group-bar { flex: 0 0 90pt; height: 4pt; background: #ececef; border-radius: 2pt; overflow: hidden; }
+      .group-bar > i { display: block; height: 100%; background: #2c2e36; border-radius: 2pt; }
+      ul.todos { list-style: none; padding: 0; margin: 4pt 0 0; }
+      ul.todos li {
+        display: flex; align-items: flex-start; gap: 8pt; padding: 3pt 0;
+        page-break-inside: avoid;
+      }
+      ul.todos .box {
+        flex: 0 0 auto; width: 11pt; height: 11pt; border: 1.2pt solid #15161b;
+        border-radius: 2pt; margin-top: 2pt; position: relative; background: #fff;
+      }
+      ul.todos .box.done { background: #15161b; }
+      ul.todos .box.done::after {
+        content: ""; position: absolute; left: 2pt; top: 0pt;
+        width: 4pt; height: 7pt; border-right: 1.5pt solid #fff; border-bottom: 1.5pt solid #fff;
+        transform: rotate(45deg);
+      }
+      ul.todos .text { flex: 1; }
+      ul.todos li.done .text { color: #888a93; text-decoration: line-through; }
+      .empty { color: #888a93; font-style: italic; padding: 4pt 0; }
+      .sketch { margin-top: 10pt; page-break-inside: avoid; }
+      .sketch img { width: 100%; max-height: 110mm; object-fit: contain;
+        border: 1px solid #d6d6d8; border-radius: 4pt; background: #fff; }
+      .sketch-cap { font-size: 8.5pt; color: #5b5d68; margin-top: 2pt; text-align: right; }
+      .doc-foot { margin-top: 14pt; padding-top: 8pt; border-top: 1px solid #ececef;
+        font-size: 8pt; color: #888a93; display: flex; justify-content: space-between; }
+    `;
+
+    const dayHtml = days.map((d) => {
+      const blocksHtml = d.blocks.length === 0
+        ? `<div class="empty">— no lists —</div>`
+        : d.blocks.map((b) => {
+            const pct = b.total === 0 ? 0 : Math.round((b.done / b.total) * 100);
+            const items = b.items.length === 0
+              ? `<li><span class="text empty">— empty —</span></li>`
+              : b.items.map((t) => `
+                  <li class="${t.done ? 'done' : ''}">
+                    <span class="box ${t.done ? 'done' : ''}"></span>
+                    <span class="text">${escapeHtml(t.title)}</span>
+                  </li>`).join('');
+            return `
+              <section class="group">
+                <h3 class="group-h">
+                  <span>${escapeHtml(b.group.title || 'Untitled')}</span>
+                  <span class="group-count">${b.done}/${b.total}</span>
+                  <span class="group-bar"><i style="width:${pct}%"></i></span>
+                </h3>
+                <ul class="todos">${items}</ul>
+              </section>`;
+          }).join('');
+      const sketchHtml = d.sketchPng
+        ? `<div class="sketch"><img src="${d.sketchPng}" alt="Sketch"/><div class="sketch-cap">Sketch · ${DOW_LONG[d.date.getDay()]}</div></div>`
+        : '';
+      return `
+        <article class="day ${scope === 'week' ? 'day-week' : ''}">
+          <header class="day-head">
+            <h2 class="day-h">${DOW_LONG[d.date.getDay()]}</h2>
+            <span class="day-date">${MONTHS[d.date.getMonth()]} ${d.date.getDate()}, ${d.date.getFullYear()}</span>
+            <span class="day-totals">${d.doneSum} / ${d.total} done</span>
+          </header>
+          ${blocksHtml}
+          ${sketchHtml}
+        </article>`;
+    }).join('');
+
+    const subtitle = scope === 'week' ? 'Weekly export' : 'Daily export';
+    const stamp = new Date().toLocaleString();
+    return `<!doctype html>
+<html><head><meta charset="utf-8"/><title>${escapeHtml(title)}</title>
+<style>${css}</style></head><body>
+  <header class="doc-head">
+    <div>
+      <h1 class="doc-title">${escapeHtml(title)}</h1>
+      <div class="doc-sub">${subtitle} · Weekly Todo</div>
+    </div>
+    <div class="doc-sub">${escapeHtml(stamp)}</div>
+  </header>
+  ${dayHtml}
+  <footer class="doc-foot">
+    <span>Weekly Todo</span>
+    <span>Generated ${escapeHtml(stamp)}</span>
+  </footer>
+</body></html>`;
+  }
+
+  function openPrintFrame(html, title) {
+    // Remove any previous frame
+    const old = document.getElementById('__print_frame');
+    if (old) old.remove();
+    const iframe = document.createElement('iframe');
+    iframe.id = '__print_frame';
+    iframe.setAttribute('aria-hidden', 'true');
+    iframe.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden;';
+    document.body.appendChild(iframe);
+    const doc = iframe.contentDocument;
+    doc.open(); doc.write(html); doc.close();
+    // Set a sensible filename hint for the system print dialog
+    try { iframe.contentWindow.document.title = title; } catch (_) {}
+    const triggerPrint = () => {
+      try { iframe.contentWindow.focus(); } catch (_) {}
+      try { iframe.contentWindow.print(); } catch (_) {}
+      // Cleanup after the system print sheet is dismissed.
+      // We can't reliably hook the dismissal, so remove after a generous delay.
+      setTimeout(() => { try { iframe.remove(); } catch (_) {} }, 60000);
+    };
+    // Wait for any data: URIs (sketch images) to decode before printing.
+    const imgs = doc.images ? Array.from(doc.images) : [];
+    if (imgs.length === 0) {
+      setTimeout(triggerPrint, 120);
+    } else {
+      let pending = imgs.length;
+      const done = () => { if (--pending <= 0) setTimeout(triggerPrint, 120); };
+      imgs.forEach((img) => {
+        if (img.complete) done();
+        else { img.onload = done; img.onerror = done; }
+      });
+      // Hard timeout in case something hangs.
+      setTimeout(triggerPrint, 1500);
+    }
+  }
+
   return (
     <div className="app">
       <Sidebar
@@ -373,6 +565,8 @@ function App() {
         onTag={(tag) => setSearch(tag)}
         onExport={exportData}
         onImport={importData}
+        onExportPdf={exportPdf}
+        onBulkClear={bulkClearDays}
         importMsg={importMsg}
       />
       <main className="main">
@@ -441,7 +635,7 @@ function App() {
 }
 
 // ---------- Sidebar ----------
-function Sidebar({ weekStart, dateKey, onPickDate, onShiftWeek, onJumpToday, onOpenPicker, totalsByKey, themePref, setThemePref, isDark, allTags, onTag, onExport, onImport, importMsg }) {
+function Sidebar({ weekStart, dateKey, onPickDate, onShiftWeek, onJumpToday, onOpenPicker, totalsByKey, themePref, setThemePref, isDark, allTags, onTag, onExport, onImport, onExportPdf, onBulkClear, importMsg }) {
   const cycleTheme = () => {
     const next = themePref === 'light' ? 'dark' : themePref === 'dark' ? 'system' : 'light';
     setThemePref(next);
@@ -454,17 +648,107 @@ function Sidebar({ weekStart, dateKey, onPickDate, onShiftWeek, onJumpToday, onO
     return `${MONTHS[weekStart.getMonth()].slice(0,3)} – ${MONTHS[last.getMonth()].slice(0,3)} ${last.getFullYear()}`;
   })();
 
+  // ---------- Selection mode ----------
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState(() => new Set());
+  const [confirm, setConfirm] = useState(null); // { action: 'tasks'|'sketches'|'both', keys: [], counts: {...} }
+  const longPressRef = useRef({ id: null, x: 0, y: 0, fired: false });
+
+  const exitSelect = () => { setSelectMode(false); setSelected(new Set()); };
+  const toggleKey = (k) => {
+    setSelected((p) => {
+      const n = new Set(p);
+      if (n.has(k)) n.delete(k); else n.add(k);
+      return n;
+    });
+  };
+  const enterSelectWith = (k) => {
+    setSelectMode(true);
+    setSelected(new Set([k]));
+  };
+
+  const onDayPointerDown = (k, e) => {
+    if (selectMode) return;
+    const id = e.pointerId;
+    longPressRef.current = { id, x: e.clientX, y: e.clientY, fired: false };
+    const el = e.currentTarget;
+    const timer = setTimeout(() => {
+      longPressRef.current.fired = true;
+      try { if (navigator.vibrate) navigator.vibrate(12); } catch (_) {}
+      enterSelectWith(k);
+    }, 480);
+    const cancel = () => { clearTimeout(timer); el.removeEventListener('pointerup', cancel); el.removeEventListener('pointercancel', cancel); el.removeEventListener('pointermove', onMove); };
+    const onMove = (ev) => {
+      const dx = ev.clientX - longPressRef.current.x;
+      const dy = ev.clientY - longPressRef.current.y;
+      if (dx * dx + dy * dy > 64) cancel();
+    };
+    el.addEventListener('pointerup', cancel, { once: true });
+    el.addEventListener('pointercancel', cancel, { once: true });
+    el.addEventListener('pointermove', onMove);
+  };
+
+  const onDayClick = (k) => {
+    if (longPressRef.current.fired) { longPressRef.current.fired = false; return; }
+    if (selectMode) toggleKey(k);
+    else onPickDate(k);
+  };
+
+  const selectAllInWeek = () => {
+    const next = new Set(selected);
+    days.forEach((d) => next.add(toKey(d)));
+    setSelected(next);
+  };
+
+  const computeCounts = (keys) => {
+    let tasks = 0, lists = 0, sketches = 0;
+    keys.forEach((k) => {
+      const t = totalsByKey[k];
+      if (t) { tasks += t.total; lists += t.lists || 0; sketches += t.strokes || 0; }
+    });
+    return { tasks, lists, sketches };
+  };
+
+  const askConfirm = (action) => {
+    const keys = Array.from(selected);
+    if (keys.length === 0) return;
+    setConfirm({ action, keys, counts: computeCounts(keys) });
+  };
+
+  const runConfirm = async () => {
+    if (!confirm) return;
+    const { action, keys } = confirm;
+    const opts = action === 'both'
+      ? { tasks: true, sketches: true }
+      : action === 'sketches'
+        ? { tasks: false, sketches: true }
+        : { tasks: true, sketches: false };
+    await onBulkClear(keys, opts);
+    setConfirm(null);
+    exitSelect();
+  };
+
   return (
-    <aside className="sidebar">
-      <div className="brand">
-        <div className="brand-mark" aria-hidden>
-          <span className="brand-dot" /><span className="brand-dot" /><span className="brand-dot" />
+    <aside className={`sidebar ${selectMode ? 'is-selecting' : ''}`}>
+      {selectMode ? (
+        <div className="select-head">
+          <button className="icon-btn" onClick={exitSelect} aria-label="Exit selection"><Icon.X/></button>
+          <div className="select-head-text">
+            <div className="select-count">{selected.size} day{selected.size === 1 ? '' : 's'} selected</div>
+            <button className="select-all-btn" onClick={selectAllInWeek}>Select whole week</button>
+          </div>
         </div>
-        <div className="brand-text">
-          <div className="brand-name">Weekly</div>
-          <div className="brand-sub">Plan · sketch · search</div>
+      ) : (
+        <div className="brand">
+          <div className="brand-mark" aria-hidden>
+            <span className="brand-dot" /><span className="brand-dot" /><span className="brand-dot" />
+          </div>
+          <div className="brand-text">
+            <div className="brand-name">Weekly</div>
+            <div className="brand-sub">Plan · sketch · search</div>
+          </div>
         </div>
-      </div>
+      )}
 
       <div className="week-head">
         <button className="week-nav" onClick={() => onShiftWeek(-1)} aria-label="Previous week"><span style={{transform:'rotate(180deg)', display:'grid'}}><Icon.Chevron/></span></button>
@@ -477,11 +761,24 @@ function Sidebar({ weekStart, dateKey, onPickDate, onShiftWeek, onJumpToday, onO
           const k = toKey(d);
           const t = totalsByKey[k] || { done: 0, total: 0 };
           const pct = t.total === 0 ? 0 : Math.round((t.done / t.total) * 100);
-          const active = k === dateKey;
+          const active = !selectMode && k === dateKey;
           const today = k === TODAY_KEY;
+          const checked = selected.has(k);
           return (
-            <button key={k} className={`day-btn ${active ? 'is-active' : ''} ${today ? 'is-today' : ''}`} onClick={() => onPickDate(k)} aria-current={active ? 'page' : undefined}>
+            <button
+              key={k}
+              className={`day-btn ${active ? 'is-active' : ''} ${today ? 'is-today' : ''} ${selectMode ? 'is-select' : ''} ${checked ? 'is-checked' : ''}`}
+              onPointerDown={(e) => onDayPointerDown(k, e)}
+              onClick={() => onDayClick(k)}
+              aria-current={active ? 'page' : undefined}
+              aria-pressed={selectMode ? checked : undefined}
+            >
               <div className="day-btn-row">
+                {selectMode && (
+                  <span className={`day-check ${checked ? 'is-checked' : ''}`} aria-hidden>
+                    {checked && <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M3 8.5l3.2 3 6.8-7"/></svg>}
+                  </span>
+                )}
                 <span className="day-num">{d.getDate()}</span>
                 <span className="day-label-wrap">
                   <span className="day-short">{DOW_SHORT[d.getDay()]}</span>
@@ -497,33 +794,72 @@ function Sidebar({ weekStart, dateKey, onPickDate, onShiftWeek, onJumpToday, onO
         })}
       </nav>
 
-      <div className="sidebar-tools">
-        <button className="tool-row" onClick={onOpenPicker}>
-          <span className="tool-icon"><Icon.Calendar/></span>
-          <span className="tool-text">Jump to date</span>
-        </button>
-        <button className="tool-row" onClick={onJumpToday}>
-          <span className="tool-icon today-mini" aria-hidden>{TODAY.getDate()}</span>
-          <span className="tool-text">Go to today</span>
-        </button>
-        <button className="tool-row" onClick={onExport}>
-          <span className="tool-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12M7 8l5-5 5 5M5 21h14"/></svg></span>
-          <span className="tool-text">Export backup</span>
-        </button>
-        <button className="tool-row" onClick={() => onImport('merge')}>
-          <span className="tool-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 21V9M7 16l5 5 5-5M5 3h14"/></svg></span>
-          <span className="tool-text">Import (merge)</span>
-        </button>
-        <button className="tool-row" onClick={() => onImport('replace')}>
-          <span className="tool-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg></span>
-          <span className="tool-text">Import (replace)</span>
-        </button>
-        {importMsg && (
-          <div className={`import-msg ${importMsg.kind}`}>{importMsg.text}</div>
-        )}
-      </div>
+      {selectMode ? (
+        <div className="select-actions">
+          <button
+            className="select-action danger"
+            onClick={() => askConfirm('tasks')}
+            disabled={selected.size === 0}
+          >
+            <Icon.Trash/> <span>Clear tasks</span>
+          </button>
+          <button
+            className="select-action"
+            onClick={() => askConfirm('sketches')}
+            disabled={selected.size === 0}
+          >
+            <Icon.Eraser/> <span>Clear sketches</span>
+          </button>
+          <button
+            className="select-action danger-strong"
+            onClick={() => askConfirm('both')}
+            disabled={selected.size === 0}
+          >
+            <Icon.Trash/> <span>Clear everything</span>
+          </button>
+          <button className="select-action ghost" onClick={exitSelect}>Cancel</button>
+        </div>
+      ) : (
+        <div className="sidebar-tools">
+          <button className="tool-row" onClick={onOpenPicker}>
+            <span className="tool-icon"><Icon.Calendar/></span>
+            <span className="tool-text">Jump to date</span>
+          </button>
+          <button className="tool-row" onClick={onJumpToday}>
+            <span className="tool-icon today-mini" aria-hidden>{TODAY.getDate()}</span>
+            <span className="tool-text">Go to today</span>
+          </button>
+          <button className="tool-row" onClick={() => { setSelectMode(true); setSelected(new Set()); }}>
+            <span className="tool-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 12l3 3 7-7"/></svg></span>
+            <span className="tool-text">Select days</span>
+          </button>
+          <button className="tool-row" onClick={() => onExportPdf('day')}>
+            <span className="tool-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect x="6" y="3" width="12" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h4"/></svg></span>
+            <span className="tool-text">Print day (PDF)</span>
+          </button>
+          <button className="tool-row" onClick={() => onExportPdf('week')}>
+            <span className="tool-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg></span>
+            <span className="tool-text">Print week (PDF)</span>
+          </button>
+          <button className="tool-row" onClick={onExport}>
+            <span className="tool-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12M7 8l5-5 5 5M5 21h14"/></svg></span>
+            <span className="tool-text">Export backup</span>
+          </button>
+          <button className="tool-row" onClick={() => onImport('merge')}>
+            <span className="tool-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 21V9M7 16l5 5 5-5M5 3h14"/></svg></span>
+            <span className="tool-text">Import (merge)</span>
+          </button>
+          <button className="tool-row" onClick={() => onImport('replace')}>
+            <span className="tool-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg></span>
+            <span className="tool-text">Import (replace)</span>
+          </button>
+          {importMsg && (
+            <div className={`import-msg ${importMsg.kind}`}>{importMsg.text}</div>
+          )}
+        </div>
+      )}
 
-      {allTags.length > 0 && (
+      {!selectMode && allTags.length > 0 && (
         <div className="tag-rail">
           <div className="tag-rail-head"><Icon.Tag/> <span>Tags</span></div>
           <div className="tag-rail-list">
@@ -546,7 +882,61 @@ function Sidebar({ weekStart, dateKey, onPickDate, onShiftWeek, onJumpToday, onO
         </button>
         <div className="offline-badge"><span className="offline-dot"/> Offline ready</div>
       </div>
+
+      {confirm && (
+        <ConfirmClear
+          payload={confirm}
+          onCancel={() => setConfirm(null)}
+          onConfirm={runConfirm}
+        />
+      )}
     </aside>
+  );
+}
+
+// ---------- Confirm clear modal ----------
+function ConfirmClear({ payload, onCancel, onConfirm }) {
+  const { action, keys, counts } = payload;
+  const dayLabel = (k) => {
+    const d = fromKey(k);
+    return `${DOW_SHORT[d.getDay()]} ${d.getDate()}`;
+  };
+  const summary = (() => {
+    if (action === 'tasks')
+      return { title: 'Clear tasks?', body: `Delete all lists and tasks for these days. Sketches will stay.`, primary: 'Clear tasks' };
+    if (action === 'sketches')
+      return { title: 'Clear sketches?', body: `Erase all sketch ink for these days. Tasks will stay.`, primary: 'Clear sketches' };
+    return { title: 'Clear everything?', body: `Delete all lists, tasks, and sketches for these days.`, primary: 'Clear everything' };
+  })();
+  return (
+    <div className="modal-shell" onClick={onCancel}>
+      <div className="modal confirm-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <h3 className="modal-title">{summary.title}</h3>
+          <button className="modal-close" onClick={onCancel} aria-label="Close"><Icon.X/></button>
+        </div>
+        <div className="confirm-body">
+          <p className="confirm-prose">{summary.body}</p>
+          <div className="confirm-chips">
+            {keys.slice(0, 14).map((k) => <span key={k} className="confirm-chip">{dayLabel(k)}</span>)}
+            {keys.length > 14 && <span className="confirm-chip more">+{keys.length - 14}</span>}
+          </div>
+          <div className="confirm-counts">
+            {action !== 'sketches' && (
+              <div><b>{counts.tasks}</b> task{counts.tasks === 1 ? '' : 's'} across <b>{counts.lists}</b> list{counts.lists === 1 ? '' : 's'}</div>
+            )}
+            {action !== 'tasks' && (
+              <div><b>{counts.sketches}</b> sketch stroke{counts.sketches === 1 ? '' : 's'}</div>
+            )}
+          </div>
+          <p className="confirm-warn">This can't be undone. Tip: export a backup first.</p>
+        </div>
+        <div className="modal-foot confirm-foot">
+          <button className="btn btn-ghost" onClick={onCancel}>Cancel</button>
+          <button className="btn btn-danger" onClick={onConfirm}>{summary.primary}</button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -952,23 +1342,37 @@ function DrawSheet({ date, dateKey, strokes, onAdd, onRemoveStroke, onClear, onC
     if (penOnly) return e.pointerType === 'pen' || e.pointerType === 'mouse';
     return true;
   }
+  // S Pen barrel button held, or pen flipped to eraser tip → temporary erase.
+  // Different devices/firmwares report the side button differently, so we cast a wide net:
+  //   - e.buttons & 32  = stylus barrel (W3C)
+  //   - e.buttons & 2   = secondary button (right-click / S Pen side on Samsung)
+  //   - e.button === 5  = eraser-tip / barrel reported on pointerdown
+  function isBarrelErase(e) {
+    if (e.pointerType !== 'pen') return false;
+    if ((e.buttons & 32) === 32) return true;
+    if ((e.buttons & 2)  === 2)  return true;
+    if (e.button === 5) return true;
+    return false;
+  }
+  const barrelEraseRef = useRef(false);
 
   const onPointerDown = (e) => {
     if (!shouldAccept(e)) return;
     e.target.setPointerCapture && e.target.setPointerCapture(e.pointerId);
     drawing.current = true;
+    barrelEraseRef.current = isBarrelErase(e);
     const pt = getRel(e);
-    if (tool === 'eraser') {
-      // Hit-test strokes
+    const effectiveTool = barrelEraseRef.current ? 'eraser' : tool;
+    if (effectiveTool === 'eraser') {
       hitErase(pt);
       return;
     }
     liveStroke.current = {
       id: WeeklyDB.uid('s'),
       dateKey,
-      tool,
-      color: tool === 'highlighter' ? color : color,
-      width: tool === 'highlighter' ? Math.max(width * 4, 16) : width,
+      tool: effectiveTool,
+      color,
+      width: effectiveTool === 'highlighter' ? Math.max(width * 4, 16) : width,
       points: [pt],
       createdAt: Date.now(),
     };
@@ -977,15 +1381,22 @@ function DrawSheet({ date, dateKey, strokes, onAdd, onRemoveStroke, onClear, onC
   const onPointerMove = (e) => {
     if (!drawing.current) return;
     if (!shouldAccept(e)) return;
+    // Re-check barrel during the stroke so users can press/release mid-gesture.
+    if (e.pointerType === 'pen') barrelEraseRef.current = isBarrelErase(e);
     const pt = getRel(e);
-    if (tool === 'eraser') { hitErase(pt); return; }
-    liveStroke.current.points.push(pt);
-    redraw();
+    const effectiveTool = barrelEraseRef.current ? 'eraser' : tool;
+    if (effectiveTool === 'eraser') { hitErase(pt); return; }
+    if (liveStroke.current) {
+      liveStroke.current.points.push(pt);
+      redraw();
+    }
   };
   const onPointerUp = (e) => {
     if (!drawing.current) return;
     drawing.current = false;
-    if (tool !== 'eraser' && liveStroke.current) {
+    const wasErasing = barrelEraseRef.current || tool === 'eraser';
+    barrelEraseRef.current = false;
+    if (!wasErasing && liveStroke.current) {
       const finished = liveStroke.current;
       liveStroke.current = null;
       onAdd(finished);
@@ -1066,11 +1477,11 @@ function DrawSheet({ date, dateKey, strokes, onAdd, onRemoveStroke, onClear, onC
             onPointerUp={onPointerUp}
             onPointerLeave={onPointerUp}
             onPointerCancel={onPointerUp}
-            style={{ touchAction: penOnly ? 'auto' : 'none' }}
+            style={{ touchAction: 'none' }}
           />
           {strokes.length === 0 && (
             <div className="draw-hint">
-              Sketch with the S Pen — pressure controls stroke width. Toggle <strong>S Pen only</strong> off to draw with a finger.
+              Sketch with the S Pen — pressure controls stroke width. Hold the S Pen <strong>side button</strong> while drawing to erase. Toggle <strong>S Pen only</strong> off to draw with a finger.
             </div>
           )}
         </div>

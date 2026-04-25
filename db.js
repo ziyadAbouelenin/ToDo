@@ -134,6 +134,73 @@
     });
   }
 
+  async function clearDays(dateKeys, opts) {
+    // opts: { tasks?: boolean, sketches?: boolean }
+    const o = opts || { tasks: true, sketches: false };
+    const keySet = new Set(dateKeys);
+    if (keySet.size === 0) return;
+    const stores = [];
+    if (o.tasks) stores.push('groups', 'todos');
+    if (o.sketches) stores.push('strokes');
+    if (stores.length === 0) return;
+    const t = await tx(stores, 'readwrite');
+    if (!t) {
+      if (o.tasks) {
+        const removedGroupIds = new Set(memoryStore.groups.filter((g) => keySet.has(g.dateKey)).map((g) => g.id));
+        memoryStore.groups = memoryStore.groups.filter((g) => !keySet.has(g.dateKey));
+        memoryStore.todos = memoryStore.todos.filter((td) => !removedGroupIds.has(td.groupId));
+      }
+      if (o.sketches) {
+        memoryStore.strokes = memoryStore.strokes.filter((s) => !keySet.has(s.dateKey));
+      }
+      saveMirror();
+      return;
+    }
+    return new Promise((resolve, reject) => {
+      if (o.tasks) {
+        const groupStore = t.objectStore('groups');
+        const todoStore = t.objectStore('todos');
+        const gIdx = groupStore.index('dateKey');
+        const removedGroupIds = [];
+        let pendingKeys = keySet.size;
+        keySet.forEach((k) => {
+          gIdx.openCursor(IDBKeyRange.only(k)).onsuccess = (ev) => {
+            const cur = ev.target.result;
+            if (cur) {
+              removedGroupIds.push(cur.primaryKey);
+              groupStore.delete(cur.primaryKey);
+              cur.continue();
+            } else {
+              pendingKeys--;
+              if (pendingKeys === 0) {
+                // Now remove todos belonging to deleted groups.
+                const tIdx = todoStore.index('groupId');
+                removedGroupIds.forEach((gid) => {
+                  tIdx.openCursor(IDBKeyRange.only(gid)).onsuccess = (e2) => {
+                    const c2 = e2.target.result;
+                    if (c2) { todoStore.delete(c2.primaryKey); c2.continue(); }
+                  };
+                });
+              }
+            }
+          };
+        });
+      }
+      if (o.sketches) {
+        const sStore = t.objectStore('strokes');
+        const sIdx = sStore.index('dateKey');
+        keySet.forEach((k) => {
+          sIdx.openCursor(IDBKeyRange.only(k)).onsuccess = (ev) => {
+            const cur = ev.target.result;
+            if (cur) { sStore.delete(cur.primaryKey); cur.continue(); }
+          };
+        });
+      }
+      t.oncomplete = () => resolve();
+      t.onerror = () => reject(t.error);
+    });
+  }
+
   async function clearStrokesFor(dateKey) {
     const t = await tx(['strokes'], 'readwrite');
     if (!t) {
@@ -245,6 +312,7 @@
     deleteTodo:   (id) => del('todos',   'todos',   id),
     deleteStroke: (id) => del('strokes', 'strokes', id),
     clearStrokesFor,
+    clearDays,
     bulkSeed,
     exportAll,
     importAll,
