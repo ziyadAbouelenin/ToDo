@@ -1,5 +1,5 @@
 // Minimal offline-first service worker.
-const CACHE = 'weekly-todo-v4';
+const CACHE = 'weekly-todo-v8';
 const ASSETS = [
   './',
   './index.html',
